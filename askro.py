@@ -69,72 +69,142 @@ TUI_STYLE = Style(
 )
 
 
-def load_api_key() -> Optional[str]:
-    """Retrieve Gemini API key from environment or local/user config files."""
-    # 1. Environment variables
-    api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-    if api_key and api_key.strip():
-        return api_key.strip()
+# ─── Provider Registry & Config ──────────────────────────────────────────────
+PROVIDERS = {
+    "gemini": {
+        "label": "Gemini (Google)",
+        "env_vars": ("GEMINI_API_KEY", "GOOGLE_API_KEY"),
+        "key_url": "https://aistudio.google.com/app/apikey",
+    },
+}
 
-    # 2. Check ~/.askro.env or local .env
+PLACEHOLDER_MARKERS = ("your-gemini-api-key", "your_api_key_here", "placeholder", "[gcp_api_key]")
+
+
+def config_path() -> str:
+    """Location of the saved provider/API key config (override with ASKRO_CONFIG)."""
+    return os.environ.get("ASKRO_CONFIG") or os.path.expanduser("~/.askro/config.json")
+
+
+def load_config() -> dict:
+    """Load saved config; return {} if missing or unreadable."""
+    try:
+        with open(config_path(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_config(config: dict) -> None:
+    """Persist config with owner-only permissions (it contains an API key)."""
+    path = config_path()
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2)
+    os.chmod(path, 0o600)
+
+
+def is_placeholder(key: str) -> bool:
+    return any(p in key.lower() for p in PLACEHOLDER_MARKERS)
+
+
+def select_provider() -> str:
+    """Ask the user to choose an AI provider."""
+    choices = [questionary.Choice(title=p["label"], value=name) for name, p in PROVIDERS.items()]
+    provider = questionary.select(
+        "Choose a provider:",
+        choices=choices,
+        style=TUI_STYLE,
+        use_arrow_keys=True,
+    ).ask()
+    if not provider:
+        print("Cancelled.")
+        sys.exit(0)
+    return provider
+
+
+def prompt_api_key(provider: str) -> str:
+    """Ask for the provider's API key (input is masked)."""
+    info = PROVIDERS[provider]
+    print(f"Get a key at: {info['key_url']}")
+    key = questionary.password(
+        f"Enter your {info['label']} API key:",
+        style=TUI_STYLE,
+        validate=lambda v: bool(v.strip()) and not is_placeholder(v) or "Please enter a real API key",
+    ).ask()
+    if not key:
+        print("Cancelled.")
+        sys.exit(0)
+    return key.strip()
+
+
+def env_api_key(provider: str) -> Optional[str]:
+    """API key from environment variables or ~/.askro.env / local .env (legacy sources)."""
+    env_vars = PROVIDERS[provider]["env_vars"]
+    for var in env_vars:
+        val = os.environ.get(var, "").strip()
+        if val and not is_placeholder(val):
+            return val
+
     candidates = [
         os.path.expanduser("~/.askro.env"),
         os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"),
     ]
     for filepath in candidates:
-        if os.path.isfile(filepath):
-            try:
-                with open(filepath, "r", encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if line and not line.startswith("#") and "=" in line:
-                            key, val = line.split("=", 1)
-                            key = key.strip()
-                            val = val.strip().strip("'\"")
-                            if key in ("GEMINI_API_KEY", "GOOGLE_API_KEY") and val:
-                                os.environ[key] = val
-                                return val
-            except Exception:
-                pass
-
+        if not os.path.isfile(filepath):
+            continue
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#") and "=" in line:
+                        key, val = line.split("=", 1)
+                        val = val.strip().strip("'\"")
+                        if key.strip() in env_vars and val and not is_placeholder(val):
+                            return val
+        except OSError:
+            pass
     return None
 
 
-def get_genai_client() -> genai.Client:
-    """Initialize Google GenAI SDK client with proper authentication."""
-    api_key = load_api_key()
+def setup_provider(reconfigure: bool = False) -> tuple:
+    """
+    Resolve (provider, api_key). First run (or --reconfigure) walks the user through
+    choosing a provider and entering an API key, then saves it for later runs.
+    """
+    config = load_config()
+    provider = config.get("provider")
+    api_key = (config.get("api_keys") or {}).get(provider) if provider in PROVIDERS else None
 
-    # Detect placeholder strings
-    if api_key and any(p in api_key.lower() for p in ("your-gemini-api-key", "your_api_key_here", "placeholder")):
-        print("\n⚠️ Notice: GEMINI_API_KEY in ~/.askro.env is set to a placeholder.")
-        print("Please edit ~/.askro.env and paste your actual Gemini API key:")
-        print("  GEMINI_API_KEY=AIzaSy...")
-        print("\nGet a free API key at: https://aistudio.google.com/app/apikey\n")
-        sys.exit(1)
+    if not reconfigure and provider in PROVIDERS and api_key and not is_placeholder(api_key):
+        return provider, api_key
 
-    if api_key:
-        return genai.Client(api_key=api_key)
-
-    # Check for Google Cloud project (Vertex AI fallback)
-    gcp_project = os.environ.get("GOOGLE_CLOUD_PROJECT")
-    if gcp_project:
-        try:
-            return genai.Client(vertexai=True, project=gcp_project)
-        except Exception:
-            pass
-
-    # Attempt default initialization
     try:
-        return genai.Client()
-    except Exception:
-        print("\n❌ Error: Google Gemini API key not found.\n")
-        print("To authenticate AskRo, please set your GEMINI_API_KEY:")
-        print("  export GEMINI_API_KEY='your_api_key_here'\n")
-        print("You can get a free API key with your Google account at:")
-        print("  👉 https://aistudio.google.com/app/apikey\n")
-        print("Alternatively, you can create a ~/.askro.env file containing:")
-        print("  GEMINI_API_KEY=your_api_key_here\n")
-        sys.exit(1)
+        provider = select_provider()
+        api_key = env_api_key(provider) if not reconfigure else None
+        if api_key:
+            print(f"✔ Using {PROVIDERS[provider]['label']} API key from environment.")
+        else:
+            api_key = prompt_api_key(provider)
+    except KeyboardInterrupt:
+        print("\nCancelled.")
+        sys.exit(0)
+
+    config["provider"] = provider
+    config.setdefault("api_keys", {})[provider] = api_key
+    try:
+        save_config(config)
+        print(f"✔ Saved to {config_path()}\n")
+    except OSError as e:
+        print(f"⚠️  Could not save config ({e}); the key will be asked again next run.\n")
+    return provider, api_key
+
+
+def get_genai_client(api_key: str) -> genai.Client:
+    """Initialize Google GenAI SDK client with the given API key."""
+    return genai.Client(api_key=api_key)
 
 
 def parse_json_safely(raw_text: str) -> dict:
@@ -243,7 +313,7 @@ def generate_commands(client: genai.Client, query: str) -> List[dict]:
                 print("\n❌ Gemini API rate limit or quota exceeded. Please wait a moment and retry.")
             elif "api_key" in err_lower or "unauthenticated" in err_lower or "401" in err_str or "403" in err_str:
                 print(f"\n❌ Gemini API authentication failure: {err_str}")
-                print("Please verify that your GEMINI_API_KEY is valid.")
+                print("Please verify your API key, or run `askro --reconfigure` to enter a new one.")
             elif "timeout" in err_lower or "timed out" in err_lower:
                 print("\n❌ Network timeout: Gemini API did not respond in time. Please try again.")
             else:
@@ -280,15 +350,27 @@ def main():
         print("\nUsage:")
         print("  askro <natural language query>")
         print("  askro               (interactive prompt)")
+        print("  askro --reconfigure (choose provider / enter API key again)")
+        print("\nOn first run AskRo asks you to choose a provider and enter its API key,")
+        print(f"then saves them to {config_path()} for later runs.")
         print("\nExamples:")
         print("  askro find files larger than 500MB")
         print("  askro kill process listening on port 8080")
         print("  askro show git branches sorted by last commit")
         sys.exit(0)
 
+    args = sys.argv[1:]
+    reconfigure = False
+    if args and args[0] in ("--reconfigure", "--setup"):
+        reconfigure = True
+        args = args[1:]
+
+    # Provider selection & API key (prompted on first run or with --reconfigure)
+    provider, api_key = setup_provider(reconfigure=reconfigure)
+
     # Query extraction: accept CLI arguments or prompt interactively
-    if len(sys.argv) > 1:
-        query = " ".join(sys.argv[1:]).strip()
+    if args:
+        query = " ".join(args).strip()
     else:
         try:
             query = questionary.text(
@@ -305,9 +387,9 @@ def main():
             sys.exit(0)
 
     # Initialize client & request suggestions
-    client = get_genai_client()
+    client = get_genai_client(api_key)
 
-    print(f"\n🔍 Consulting Gemini for: \"{query}\"...")
+    print(f"\n🔍 Consulting {PROVIDERS[provider]['label']} for: \"{query}\"...")
     commands = generate_commands(client, query)
 
     # Build TUI choices

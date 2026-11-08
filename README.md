@@ -47,20 +47,20 @@ chmod +x askro.py
 
 ---
 
-## Authentication
+## Provider & API Key Setup
 
-AskRo uses the official **Google GenAI SDK** (`google-genai`).
+The first time you run `askro`, it walks you through setup in the terminal:
 
-1. Obtain a free Gemini API key with your Google/Gmail account at [Google AI Studio](https://aistudio.google.com/app/apikey).
-2. Export your key in your shell:
-   ```bash
-   export GEMINI_API_KEY="your-gemini-api-key"
-   ```
-3. *(Optional)* Alternatively, create a `~/.askro.env` file with:
-   ```bash
-   GEMINI_API_KEY=your-gemini-api-key
-   ```
-   AskRo will automatically load this file on startup.
+1. **Choose a provider** with the arrow keys (currently: Gemini).
+2. **Enter your API key** (input is masked). Get a free Gemini key at [Google AI Studio](https://aistudio.google.com/app/apikey).
+
+Your choice is saved to `~/.askro/config.json` (permissions `600`), so later runs go straight to your query. To switch providers or replace the key:
+
+```bash
+askro --reconfigure
+```
+
+If `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) is already set in your environment or in `~/.askro.env`, AskRo uses it instead of asking for a key.
 
 ---
 
